@@ -64,20 +64,44 @@ jobs:
           cd ..
 
       # --------------------------------------------------------- llama.cpp
-      # CI runners have no GPU, so this pulls the AVX2 CPU build.
-      # Asset naming is llama-<version>-bin-<os>-<feature>-<arch>.zip, e.g.
-      # llama-b7075-bin-win-avx2-x64.zip. For end users with NVIDIA GPUs you
-      # would swap avx2 for cu12 (and ship the CUDA runtime alongside).
-      - name: Download llama-server (Windows AVX2 CPU build)
+      # CI runners have no GPU, so this pulls the plain CPU build.
+      # Asset naming is llama-<version>-bin-win-<feature>-<arch>.zip, e.g.
+      # llama-b10881-bin-win-cpu-x64.zip. For end users with NVIDIA GPUs you
+      # would swap cpu for cuda-12.4 (and ship cudart-llama-bin-win-* too).
+      #
+      # /releases/latest is unusable here: it resolves to a nightly placeholder
+      # carrying only nightly-tag.txt, because every real build is published as
+      # a prerelease. So walk the releases list and take the newest one that
+      # actually has the asset.
+      - name: Download llama-server (Windows CPU build)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $release = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-          $asset = $release.assets | Where-Object { $_.name -like "*-bin-win-avx2-x64.zip" } | Select-Object -First 1
-          if (-not $asset) {
-            Write-Host "No avx2-x64 asset. Assets in this release:"
-            $release.assets | ForEach-Object { Write-Host "  $($_.name)" }
-            throw "Expected an asset matching *-bin-win-avx2-x64.zip"
+          $headers = @{
+            "Accept"               = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+            "Authorization"        = "Bearer $env:GH_TOKEN"
           }
+          $pattern = "*-bin-win-cpu-x64.zip"
+
+          $asset = $null
+          foreach ($page in 1..3) {
+            $releases = Invoke-RestMethod -Headers $headers `
+              "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30&page=$page"
+            if (-not $releases) { break }
+            foreach ($r in $releases) {
+              $hit = $r.assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
+              if ($hit) {
+                Write-Host "using release $($r.tag_name)"
+                $asset = $hit
+                break
+              }
+            }
+            if ($asset) { break }
+          }
+          if (-not $asset) { throw "No release in the last 90 had an asset matching $pattern" }
+
           Write-Host "downloading $($asset.name)"
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile llama.zip
           Expand-Archive -Path llama.zip -DestinationPath C:\tools\llama.cpp -Force
