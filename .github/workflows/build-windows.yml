@@ -1,0 +1,144 @@
+name: Build Windows installer
+
+# Builds Industrial AI Workbench_0.1.0_x64-setup.exe on a GitHub-hosted
+# Windows runner — no local Windows machine needed. Mirrors the four stages
+# in build/build.ps1, plus the setup steps BUILD-WINDOWS.md normally has you
+# do by hand once (Rust, Node, Python, Tauri CLI, llama-server, icons).
+#
+# Trigger: push to main, or manually from the Actions tab ("Run workflow").
+# Output: download the installer from the run's "Artifacts" section.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Prebuilt binary — compiling tauri-cli from source adds ~10 min per run.
+      - name: Install Tauri CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli
+
+      # --------------------------------------------------------- Python env
+      - name: Create venv and install requirements
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+          .\.venv\Scripts\python.exe -m pip install pyinstaller
+
+      # -------------------------------------------------------------- icons
+      # tauri.conf.json references icons/*.png + icon.ico, which are not
+      # committed. Generate them from icon.png, same as the manual doc.
+      - name: Generate app icons
+        shell: pwsh
+        run: |
+          cd src-tauri
+          cargo tauri icon ..\icon.png
+          cd ..
+
+      # --------------------------------------------------------- llama.cpp
+      # CI runners have no GPU, so this pulls the AVX2 CPU build.
+      # Asset naming is llama-<version>-bin-<os>-<feature>-<arch>.zip, e.g.
+      # llama-b7075-bin-win-avx2-x64.zip. For end users with NVIDIA GPUs you
+      # would swap avx2 for cu12 (and ship the CUDA runtime alongside).
+      - name: Download llama-server (Windows AVX2 CPU build)
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -like "*-bin-win-avx2-x64.zip" } | Select-Object -First 1
+          if (-not $asset) {
+            Write-Host "No avx2-x64 asset. Assets in this release:"
+            $release.assets | ForEach-Object { Write-Host "  $($_.name)" }
+            throw "Expected an asset matching *-bin-win-avx2-x64.zip"
+          }
+          Write-Host "downloading $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile llama.zip
+          Expand-Archive -Path llama.zip -DestinationPath C:\tools\llama.cpp -Force
+
+          # Some releases nest the binaries in a subfolder; find the real one.
+          $exe = Get-ChildItem -Path C:\tools\llama.cpp -Recurse -Filter llama-server.exe |
+                 Select-Object -First 1
+          if (-not $exe) { throw "llama-server.exe not found in the extracted archive" }
+          Write-Host "llama-server at $($exe.FullName)"
+          echo (Split-Path -Parent $exe.FullName) | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Verify llama-server on PATH
+        shell: pwsh
+        run: llama-server.exe --version
+
+      # ------------------------------------------------------------- build
+      # Same four stages as build/build.ps1, run directly so failures show
+      # up per-step in the Actions log instead of as one opaque script exit.
+      - name: Freeze backend with PyInstaller
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean `
+            --distpath build\dist --workpath build\work `
+            build\backend.spec
+
+      - name: Collect sidecars
+        shell: pwsh
+        run: |
+          $Triple = (& rustc -vV | Select-String '^host:').ToString().Split(' ')[1]
+          Write-Host "target triple: $Triple"
+
+          New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
+          Copy-Item build\dist\workbench-backend.exe "src-tauri\binaries\workbench-backend-$Triple.exe" -Force
+
+          $Llama = Get-Command llama-server.exe
+          Copy-Item $Llama.Source "src-tauri\binaries\llama-server-$Triple.exe" -Force
+
+          $LlamaDir = Split-Path -Parent $Llama.Source
+          New-Item -ItemType Directory -Force -Path src-tauri\resources\lib | Out-Null
+          Get-ChildItem -Path $LlamaDir -Filter *.dll | ForEach-Object {
+            Copy-Item $_.FullName src-tauri\resources\lib -Force
+          }
+          $count = (Get-ChildItem src-tauri\resources\lib -Filter *.dll).Count
+          Write-Host "bundled $count llama.cpp DLLs"
+
+      - name: Build frontend
+        shell: pwsh
+        run: |
+          cd web
+          if (Test-Path package-lock.json) { npm ci } else { npm install }
+          npm run build
+
+      - name: Bundle installer
+        shell: pwsh
+        run: |
+          cd src-tauri
+          cargo tauri build
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IndustrialAIWorkbench-Windows-installer
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
